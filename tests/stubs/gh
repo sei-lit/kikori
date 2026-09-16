@@ -1,0 +1,41 @@
+#!/bin/bash
+# gh stub for kikori tests.
+#
+# Behavior is driven by files in $GH_STUB_DIR:
+#   repo                      "owner/repo" for `gh repo view`
+#   merged/<branch>           lines "owner/repo <base> <oid>" for `gh pr list --head <branch>`
+#   remote-commits            OIDs that exist on the remote, for `gh api repos/.../commits/<oid>`
+set -euo pipefail
+
+: "${GH_STUB_DIR:?GH_STUB_DIR must be set}"
+
+case "$1" in
+    repo)
+        # gh repo view --json nameWithOwner -q .nameWithOwner
+        cat "${GH_STUB_DIR}/repo"
+        ;;
+    pr)
+        # gh pr list --repo X --state merged --head <branch> --json ... --jq ...
+        branch=""
+        prev=""
+        for a in "$@"; do
+            [ "${prev}" = "--head" ] && branch="${a}"
+            prev="${a}"
+        done
+        [ -f "${GH_STUB_DIR}/merged/${branch}" ] && cat "${GH_STUB_DIR}/merged/${branch}"
+        exit 0
+        ;;
+    api)
+        # gh api repos/<owner>/<repo>/commits/<oid>
+        oid="${2##*/}"
+        if [ -f "${GH_STUB_DIR}/remote-commits" ] && grep -Fxq "${oid}" "${GH_STUB_DIR}/remote-commits"; then
+            echo '{}'
+            exit 0
+        fi
+        exit 1
+        ;;
+    *)
+        echo "gh stub: unhandled: $*" >&2
+        exit 1
+        ;;
+esac

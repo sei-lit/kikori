@@ -1,0 +1,659 @@
+#!/bin/bash
+# kikori cleanup — delete local branches whose PR has merged, their worktrees, and
+# resources managed by cleaner plugins.
+#
+# Candidates: every local branch except the main branch, the branch checked out
+# in the current worktree, and branches checked out in worktrees outside the
+# managed worktrees directory.
+#
+# For each candidate, merged PRs with this repository as head are looked up via
+# gh, and the branch is classified:
+#
+#   auto    proven that everything on the branch is contained in <remote>/<main>;
+#           deleted
+#   review  a merged PR exists but containment cannot be proven; shown with the
+#           reason and a manual command, not deleted (unless --force)
+#   skip    no merged PR; not shown
+#
+# The "auto" proof is any of:
+#   1. the local tip equals a merged PR head
+#   2. the local tip is reachable from <remote>/<main>
+#   3. the head was rewritten on the remote before merging (GitHub stacked PRs
+#      rebase + force-push the downstream head onto main when the upstream
+#      merges, so the local tip stays at the pre-rebase commit and fails 1./2.).
+#      All of the following must hold to conclude "no local-only changes exist
+#      and the content is in main":
+#        - the branch no longer exists on the remote
+#        - the local tip exists on the remote (pushed; no local-only commits)
+#        - <remote>/<main>..branch contains no merge commits (a merge commit's
+#          resolution cannot be compared as a patch)
+#        - every branch-side commit's patch is equivalent to some main-side
+#          commit (`git patch-id --verbatim`; whitespace-only differences count
+#          as different)
+#
+# Alongside branches, resources reported by cleaner plugins (see README) are
+# listed under the same confirmation prompt so one "y" deletes everything.
+# Unprovable branches and plugin items flagged "review" are display-only unless
+# --force is given.
+#
+# Exit codes: 0 = success (including nothing to delete),
+#             1 = cancelled or some deletions failed,
+#             2 = preconditions not met (git repository / gh / bad options)
+set -eo pipefail
+
+. "${KIKORI_ROOT}/lib/log.sh"
+. "${KIKORI_ROOT}/lib/config.sh"
+
+usage() {
+    cat <<'EOF'
+USAGE: kikori cleanup [options]
+
+OPTIONS:
+  --only <targets>   Comma-separated targets to clean. Built-in targets are
+                     "branches" and "worktrees"; every cleaner plugin adds a
+                     target named after itself. Default: all targets.
+  --force            Also delete items classified as "needs review".
+  --dry-run          List targets only; no prompt, no deletion.
+  --yes              Skip the confirmation prompt.
+  -h, --help         Show this help.
+
+EXAMPLES:
+  kikori cleanup                             # everything (branches, worktrees, all cleaners)
+  kikori cleanup --only branches,worktrees   # git only, leave plugin resources
+  kikori cleanup --only xcode-simulators     # one plugin only
+EOF
+}
+
+DRY_RUN=0
+FORCE=0
+ASSUME_YES=0
+ONLY=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --only) ONLY="${2:?--only requires a value}"; shift ;;
+        --force) FORCE=1 ;;
+        --dry-run) DRY_RUN=1 ;;
+        --yes) ASSUME_YES=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *) log_error "unknown option: $1"; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+MAIN_ROOT="$(kikori_resolve_main_root)" || { log_error "not inside a git repository (or the repository is bare)"; exit 2; }
+kikori_load_config "${MAIN_ROOT}"
+kikori_require_main_branch || exit 2
+
+MAIN_REF="${KIKORI_REMOTE}/${KIKORI_MAIN_BRANCH}"
+
+# Field separator for internal lists. Not a tab: on rows without a worktree,
+# `read` would collapse consecutive tabs and shift the reason into the
+# worktree column. Also safe for worktree paths containing spaces.
+US=$'\037'
+
+# --- target selection ----------------------------------------------------------
+
+CLEANER_TABLE="$(kikori_list_cleaners "${MAIN_ROOT}")"
+
+cleaner_path() {
+    printf '%s\n' "${CLEANER_TABLE}" | awk -F'\t' -v n="$1" '$1 == n { print $2; exit }'
+}
+
+TARGET_BRANCHES=1
+TARGET_WORKTREES=1
+SELECTED_CLEANERS="$(printf '%s\n' "${CLEANER_TABLE}" | cut -f1)"
+if [ -n "${ONLY}" ]; then
+    TARGET_BRANCHES=0
+    TARGET_WORKTREES=0
+    SELECTED_CLEANERS=""
+    IFS=',' read -ra _only_items <<< "${ONLY}"
+    for item in ${_only_items[@]+"${_only_items[@]}"}; do
+        item="$(printf '%s' "${item}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [ -z "${item}" ] && continue
+        case "${item}" in
+            branches) TARGET_BRANCHES=1 ;;
+            worktrees) TARGET_WORKTREES=1 ;;
+            *)
+                if [ -n "$(cleaner_path "${item}")" ]; then
+                    SELECTED_CLEANERS="${SELECTED_CLEANERS}${item}"$'\n'
+                else
+                    log_error "unknown cleanup target: ${item}"
+                    log_detail "available: branches, worktrees$(printf '%s\n' "${CLEANER_TABLE}" | cut -f1 | awk '{printf ", %s", $0}')"
+                    exit 2
+                fi
+                ;;
+        esac
+    done
+    SELECTED_CLEANERS="$(printf '%s' "${SELECTED_CLEANERS}" | sed '/^$/d')"
+fi
+
+# --- candidate enumeration -------------------------------------------------------
+
+# Path of the worktree that has the branch checked out (empty when none).
+# substr, not $2: worktree paths may contain spaces.
+get_worktree_path() {
+    local branch="$1"
+    git worktree list --porcelain | awk -v branch="${branch}" '
+        /^worktree / { path = substr($0, 10) }
+        $0 == "branch refs/heads/" branch { print path; exit }
+    '
+}
+
+# Emits candidates as "branch<US>worktree_path" (empty path when none).
+# The gh-based merged check is kept out so enumeration is testable on its own.
+list_candidate_branches() {
+    local base="$1"
+    local current outside_branches b wt
+
+    current="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+
+    # Worktrees outside ${base}/ are not managed by kikori; leave them alone.
+    outside_branches="$(git worktree list --porcelain | awk -v base="${base}/" '
+        /^worktree / { path = substr($0, 10); outside = (index(path, base) != 1) }
+        /^branch refs\/heads\// { if (outside) print substr($0, 19) }
+    ')"
+
+    while IFS= read -r b; do
+        [ -z "${b}" ] && continue
+        [ "${b}" = "${KIKORI_MAIN_BRANCH}" ] && continue
+        [ "${b}" = "${current}" ] && continue
+        printf '%s\n' "${outside_branches}" | grep -Fxq "${b}" && continue
+        is_protected_branch "${b}" && continue
+        wt="$(get_worktree_path "${b}")"
+        printf '%s\037%s\n' "${b}" "${wt}"
+    done < <(git for-each-ref --format='%(refname:short)' refs/heads/)
+}
+
+is_protected_branch() {
+    local b p
+    b="$1"
+    for p in ${KIKORI_PROTECTED_BRANCHES}; do
+        [ "${b}" = "${p}" ] && return 0
+    done
+    return 1
+}
+
+# --- classification --------------------------------------------------------------
+
+# Head OIDs of merged PRs whose head repository is this repository and whose
+# base is the configured main branch.
+# `gh pr list --head` matches by branch name alone and also returns same-named
+# fork branches, so filter by headRepository.nameWithOwner. The base filter
+# matters for proof 1: a PR merged into some other branch (a release branch,
+# say) proves nothing about containment in <remote>/<main>.
+merged_pr_head_oids() {
+    local branch="$1" repo base oid
+    gh pr list --repo "${OWNER_REPO}" --state merged --head "${branch}" \
+        --json headRefOid,headRepository,baseRefName \
+        --jq '.[] | "\(.headRepository.nameWithOwner) \(.baseRefName) \(.headRefOid)"' 2>/dev/null \
+    | while IFS=' ' read -r repo base oid; do
+        [ "${repo}" = "${OWNER_REPO}" ] && [ "${base}" = "${KIKORI_MAIN_BRANCH}" ] && printf '%s\n' "${oid}"
+    done
+}
+
+is_pr_head() {
+    local local_oid="$1" merged_oids="$2"
+    printf '%s\n' "${merged_oids}" | grep -Fxq "${local_oid}"
+}
+
+is_reachable_from_main() {
+    git merge-base --is-ancestor "$1" "${MAIN_REF}" 2>/dev/null
+}
+
+# Proof 3 (rewritten on the remote before merge). Returns 0 when it holds.
+# Otherwise returns 1 and prints the failed conditions to stdout, comma-joined.
+# Every command failure falls to the "not proven" side (the only direction this
+# can err is toward not deleting).
+explain_rewrite_before_merge() {
+    local branch="$1" local_oid="$2"
+    local reasons="" rc
+
+    rc=0
+    git ls-remote --exit-code --heads "${KIKORI_REMOTE}" "refs/heads/${branch}" >/dev/null 2>&1 || rc=$?
+    # Only exit 2 means "absent"; 0 means present, anything else is a failed query.
+    case "${rc}" in
+        2) ;;
+        0) reasons="${reasons}branch still exists on ${KIKORI_REMOTE}, " ;;
+        *) reasons="${reasons}could not query ${KIKORI_REMOTE} for the branch, " ;;
+    esac
+
+    gh api "repos/${OWNER_REPO}/commits/${local_oid}" >/dev/null 2>&1 \
+        || reasons="${reasons}tip not on the remote (unpushed), "
+
+    local merge_count
+    merge_count="$(git rev-list --count --min-parents=2 "${MAIN_REF}..${branch}" 2>/dev/null || echo "")"
+    [ "${merge_count}" = "0" ] || reasons="${reasons}${merge_count:-?} local merge commit(s), "
+
+    local mb main_ids branch_lines pid unmatched=0
+    mb="$(git merge-base "${MAIN_REF}" "${branch}" 2>/dev/null || echo "")"
+    if [ -n "${mb}" ] \
+        && main_ids="$(git rev-list --no-merges "${mb}..${MAIN_REF}" 2>/dev/null \
+            | git diff-tree --stdin -p 2>/dev/null | git patch-id --verbatim 2>/dev/null \
+            | cut -d' ' -f1 | sort -u)" \
+        && branch_lines="$(git rev-list --no-merges "${MAIN_REF}..${branch}" 2>/dev/null \
+            | git diff-tree --stdin -p 2>/dev/null | git patch-id --verbatim 2>/dev/null)"; then
+        while IFS=' ' read -r pid _; do
+            [ -z "${pid}" ] && continue
+            printf '%s\n' "${main_ids}" | grep -Fxq "${pid}" || unmatched=$((unmatched + 1))
+        done <<< "${branch_lines}"
+        [ "${unmatched}" = "0" ] || reasons="${reasons}${unmatched} patch(es) not equivalent, "
+    else
+        reasons="${reasons}patch comparison failed, "
+    fi
+
+    [ -z "${reasons}" ] && return 0
+    printf '%s\n' "${reasons%, }"
+    return 1
+}
+
+# Prints "auto", "review <reason>", or "skip".
+classify_branch() {
+    local branch="$1" local_oid merged_oids reasons
+    local_oid="$(git rev-parse -q --verify "refs/heads/${branch}" 2>/dev/null || echo "")"
+    [ -z "${local_oid}" ] && { printf 'skip\n'; return; }
+
+    merged_oids="$(merged_pr_head_oids "${branch}")"
+    [ -z "${merged_oids}" ] && { printf 'skip\n'; return; }
+
+    if is_pr_head "${local_oid}" "${merged_oids}" || is_reachable_from_main "${local_oid}"; then
+        printf 'auto\n'
+        return
+    fi
+
+    if reasons="$(explain_rewrite_before_merge "${branch}" "${local_oid}")"; then
+        printf 'auto\n'
+    else
+        printf 'review %s\n' "${reasons}"
+    fi
+}
+
+# --- display helpers -------------------------------------------------------------
+
+print_category() {
+    local title="$1" lines="$2"
+    [ -z "${lines}" ] && return 0
+    printf '    %s\n' "${title}" >&2
+    local count=1 line
+    while IFS= read -r line; do
+        [ -z "${line}" ] && continue
+        printf '      %b%2d)%b %s\n' "${STYLE_INFO}" "${count}" "${STYLE_RESET}" "${line}" >&2
+        count=$((count + 1))
+    done <<< "${lines}"
+    _kl_gap_content
+}
+
+# Worktree display line. `git worktree remove --force` discards uncommitted
+# changes and untracked files without leaving any trace in git, so mark which
+# worktrees hold unrecoverable content before the user presses "y".
+worktree_display_line() {
+    local wt="$1"
+    if [ -n "$(git -C "${wt}" status --porcelain 2>/dev/null)" ]; then
+        printf '%s (has uncommitted changes)\n' "${wt}"
+    else
+        printf '%s\n' "${wt}"
+    fi
+}
+
+# --- planning --------------------------------------------------------------------
+
+if [ "${DRY_RUN}" = "1" ]; then
+    log_warn "DRY RUN: nothing will be deleted (listing targets only)"
+fi
+if [ "${FORCE}" = "1" ]; then
+    log_warn "FORCE: items classified as needs-review will also be deleted"
+fi
+
+AUTO_LINES=""
+REVIEW_LINES=""
+if [ "${TARGET_BRANCHES}" = "1" ] || [ "${TARGET_WORKTREES}" = "1" ]; then
+    log_info "Enumerating candidate branches..."
+    CANDIDATES="$(list_candidate_branches "${KIKORI_WORKTREES_DIR}")"
+
+    if [ -n "${CANDIDATES}" ]; then
+        if ! command -v gh &>/dev/null; then
+            log_error "gh command not found"
+            log_detail "install it from https://cli.github.com/"
+            exit 2
+        fi
+
+        OWNER_REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+        if [ -z "${OWNER_REPO}" ]; then
+            log_error "could not resolve the repository via gh repo view"
+            exit 2
+        fi
+
+        log_info "Searching for merged-PR branches... (${OWNER_REPO})"
+
+        # A stale main ref only pushes classifications toward "review", so a
+        # failed fetch is just a warning.
+        git fetch -q "${KIKORI_REMOTE}" "${KIKORI_MAIN_BRANCH}" 2>/dev/null \
+            || log_warn "failed to fetch ${MAIN_REF} (classification may be stale)"
+
+        while IFS="${US}" read -r branch wt; do
+            [ -z "${branch}" ] && continue
+            result="$(classify_branch "${branch}")"
+            case "${result%% *}" in
+                auto)   AUTO_LINES="${AUTO_LINES}${branch}${US}${wt}"$'\n' ;;
+                review) REVIEW_LINES="${REVIEW_LINES}${branch}${US}${wt}${US}${result#review }"$'\n' ;;
+            esac
+        done <<< "${CANDIDATES}"
+
+        AUTO_LINES="$(printf '%s' "${AUTO_LINES}" | sed '/^$/d')"
+        REVIEW_LINES="$(printf '%s' "${REVIEW_LINES}" | sed '/^$/d')"
+    fi
+fi
+
+# `git worktree remove --force` discards uncommitted changes and untracked
+# files irrecoverably, so a dirty worktree is not deleted on a plain "y" (or
+# --yes): it moves to needs-review and requires --force.
+if [ "${TARGET_WORKTREES}" = "1" ] && [ "${FORCE}" != "1" ] && [ -n "${AUTO_LINES}" ]; then
+    KEPT=""
+    while IFS="${US}" read -r branch wt; do
+        [ -z "${branch}" ] && continue
+        if [ -n "${wt}" ] && [ -d "${wt}" ] && [ -n "$(git -C "${wt}" status --porcelain 2>/dev/null)" ]; then
+            REVIEW_LINES="${REVIEW_LINES}"$'\n'"${branch}${US}${wt}${US}worktree has uncommitted changes"
+        else
+            KEPT="${KEPT}${branch}${US}${wt}"$'\n'
+        fi
+    done <<< "${AUTO_LINES}"
+    AUTO_LINES="$(printf '%s' "${KEPT}" | sed '/^$/d')"
+    REVIEW_LINES="$(printf '%s\n' "${REVIEW_LINES}" | sed '/^$/d')"
+fi
+
+# Branches with a worktree cannot be deleted while the worktree exists, so when
+# "worktrees" is excluded from the targets those branches move to needs-review
+# instead of failing mid-deletion.
+if [ "${TARGET_BRANCHES}" = "1" ] && [ "${TARGET_WORKTREES}" != "1" ] && [ -n "${AUTO_LINES}" ]; then
+    KEPT=""
+    while IFS="${US}" read -r branch wt; do
+        [ -z "${branch}" ] && continue
+        if [ -n "${wt}" ] && [ -d "${wt}" ]; then
+            REVIEW_LINES="${REVIEW_LINES}"$'\n'"${branch}${US}${wt}${US}checked out in a worktree (include the 'worktrees' target)"
+        else
+            KEPT="${KEPT}${branch}${US}${wt}"$'\n'
+        fi
+    done <<< "${AUTO_LINES}"
+    AUTO_LINES="$(printf '%s' "${KEPT}" | sed '/^$/d')"
+    REVIEW_LINES="$(printf '%s\n' "${REVIEW_LINES}" | sed '/^$/d')"
+fi
+
+# Deletion list (branch US wt) and its display. --force also includes
+# needs-review branches — except rows blocked only by the excluded "worktrees"
+# target, because deleting such a branch while its worktree exists would fail
+# anyway; those stay in the needs-review display.
+DELETE_BRANCH_LINES="${AUTO_LINES}"
+DISPLAY_DELETE_BRANCH=""
+if [ -n "${AUTO_LINES}" ]; then
+    while IFS="${US}" read -r branch wt; do
+        [ -z "${branch}" ] && continue
+        DISPLAY_DELETE_BRANCH="${DISPLAY_DELETE_BRANCH}${branch}"$'\n'
+    done <<< "${AUTO_LINES}"
+fi
+if [ "${FORCE}" = "1" ] && [ -n "${REVIEW_LINES}" ]; then
+    BLOCKED_REVIEW=""
+    while IFS="${US}" read -r branch wt reason; do
+        [ -z "${branch}" ] && continue
+        if [ "${TARGET_WORKTREES}" != "1" ] && [ -n "${wt}" ] && [ -d "${wt}" ]; then
+            BLOCKED_REVIEW="${BLOCKED_REVIEW}${branch}${US}${wt}${US}${reason}"$'\n'
+            continue
+        fi
+        DELETE_BRANCH_LINES="${DELETE_BRANCH_LINES}"$'\n'"${branch}${US}${wt}"
+        DISPLAY_DELETE_BRANCH="${DISPLAY_DELETE_BRANCH}${branch} (needs review: ${reason})"$'\n'
+    done <<< "${REVIEW_LINES}"
+    DELETE_BRANCH_LINES="$(printf '%s\n' "${DELETE_BRANCH_LINES}" | sed '/^$/d')"
+    REVIEW_LINES="$(printf '%s' "${BLOCKED_REVIEW}" | sed '/^$/d')"
+fi
+DISPLAY_DELETE_BRANCH="$(printf '%s' "${DISPLAY_DELETE_BRANCH}" | sed '/^$/d')"
+
+# Worktrees about to be removed; also feeds the cleaners' plan phase.
+GONE_WORKTREES=""
+DISPLAY_DELETE_WT=""
+if [ "${TARGET_WORKTREES}" = "1" ] && [ -n "${DELETE_BRANCH_LINES}" ]; then
+    while IFS="${US}" read -r branch wt; do
+        if [ -n "${wt}" ] && [ -d "${wt}" ]; then
+            GONE_WORKTREES="${GONE_WORKTREES}${wt}"$'\n'
+            DISPLAY_DELETE_WT="${DISPLAY_DELETE_WT}$(worktree_display_line "${wt}")"$'\n'
+        fi
+    done <<< "${DELETE_BRANCH_LINES}"
+    GONE_WORKTREES="$(printf '%s' "${GONE_WORKTREES}" | sed '/^$/d')"
+    DISPLAY_DELETE_WT="$(printf '%s' "${DISPLAY_DELETE_WT}" | sed '/^$/d')"
+fi
+
+# --- cleaner plugins (plan phase) --------------------------------------------------
+
+# Per-cleaner state, kept in parallel newline lists because bash 3.2 has no
+# associative arrays: CLEANER_NAMES[i] matches CLEANER_DELETE/REVIEW/DISPLAY via
+# files under a temp dir.
+PLAN_DIR="$(mktemp -d)"
+trap 'rm -rf "${PLAN_DIR}"' EXIT
+
+# Cleaners run as separate processes; hand them the resolved context through
+# the environment so they need no git/config parsing of their own.
+export KIKORI_MAIN_ROOT="${MAIN_ROOT}"
+export KIKORI_WORKTREES_DIR
+export KIKORI_REMOTE
+export KIKORI_MAIN_BRANCH
+
+CLEANER_REVIEW_ANY=0
+CLEANER_DELETE_ANY=0
+if [ -n "${SELECTED_CLEANERS}" ]; then
+    while IFS= read -r name; do
+        [ -z "${name}" ] && continue
+        cpath="$(cleaner_path "${name}")"
+        log_info "Planning cleaner: ${name}..."
+        plan_args=(plan)
+        while IFS= read -r wt; do
+            [ -n "${wt}" ] && plan_args+=(--assume-removed "${wt}")
+        done <<< "${GONE_WORKTREES}"
+        if ! PLAN_OUT="$("${cpath}" "${plan_args[@]}" 2>/dev/null)"; then
+            log_warn "cleaner '${name}' failed to plan (excluded from this run)"
+            continue
+        fi
+        : > "${PLAN_DIR}/${name}.delete"
+        : > "${PLAN_DIR}/${name}.delete_display"
+        : > "${PLAN_DIR}/${name}.review_display"
+        while IFS=$'\t' read -r status id display reason; do
+            [ -z "${id}" ] && continue
+            case "${status}" in
+                auto)
+                    printf '%s\n' "${id}" >> "${PLAN_DIR}/${name}.delete"
+                    printf '%s\n' "${display:-${id}}" >> "${PLAN_DIR}/${name}.delete_display"
+                    ;;
+                review)
+                    if [ "${FORCE}" = "1" ]; then
+                        printf '%s\n' "${id}" >> "${PLAN_DIR}/${name}.delete"
+                        printf '%s (needs review: %s)\n' "${display:-${id}}" "${reason:-?}" >> "${PLAN_DIR}/${name}.delete_display"
+                    else
+                        printf '%s (%s)\n' "${display:-${id}}" "${reason:-?}" >> "${PLAN_DIR}/${name}.review_display"
+                    fi
+                    ;;
+                *) log_warn "cleaner '${name}' emitted an unknown status: ${status}" ;;
+            esac
+        done <<< "${PLAN_OUT}"
+        [ -s "${PLAN_DIR}/${name}.delete" ] && CLEANER_DELETE_ANY=1
+        [ -s "${PLAN_DIR}/${name}.review_display" ] && CLEANER_REVIEW_ANY=1
+    done <<< "${SELECTED_CLEANERS}"
+fi
+
+# --- summary and confirmation --------------------------------------------------------
+
+HAS_REVIEW=0
+if [ -n "${REVIEW_LINES}" ] || [ "${CLEANER_REVIEW_ANY}" = "1" ]; then
+    HAS_REVIEW=1
+fi
+HAS_DELETE=0
+if { [ "${TARGET_BRANCHES}" = "1" ] || [ "${TARGET_WORKTREES}" = "1" ]; } && [ -n "${DELETE_BRANCH_LINES}" ]; then
+    HAS_DELETE=1
+fi
+[ "${CLEANER_DELETE_ANY}" = "1" ] && HAS_DELETE=1
+
+if [ "${HAS_DELETE}" = "0" ] && [ "${HAS_REVIEW}" = "0" ]; then
+    log_success "Nothing to delete"
+    exit 0
+fi
+
+if [ "${HAS_DELETE}" = "1" ]; then
+    log_step "To be deleted" "🧹"
+    print_category "Worktrees" "${DISPLAY_DELETE_WT}"
+    if [ "${TARGET_BRANCHES}" = "1" ]; then
+        print_category "Branches" "${DISPLAY_DELETE_BRANCH}"
+    fi
+    if [ -n "${SELECTED_CLEANERS}" ]; then
+        while IFS= read -r name; do
+            [ -z "${name}" ] && continue
+            [ -s "${PLAN_DIR}/${name}.delete_display" ] || continue
+            print_category "${name}" "$(cat "${PLAN_DIR}/${name}.delete_display")"
+        done <<< "${SELECTED_CLEANERS}"
+    fi
+fi
+
+if [ "${HAS_REVIEW}" = "1" ]; then
+    log_step "Needs review (delete with: kikori cleanup --force)" "🧹"
+    REVIEW_WT_SHOWN=0
+    if [ -n "${REVIEW_LINES}" ]; then
+        while IFS="${US}" read -r branch wt reason; do
+            [ -z "${branch}" ] && continue
+            [ -z "${wt}" ] && continue
+            if [ "${REVIEW_WT_SHOWN}" = "0" ]; then
+                printf '    Worktrees\n' >&2
+                REVIEW_WT_SHOWN=1
+            fi
+            printf '      %b-%b %s (branch: %s)\n' "${STYLE_INFO}" "${STYLE_RESET}" "$(worktree_display_line "${wt}")" "${branch}" >&2
+            log_detail "      git worktree remove ${wt}"
+        done <<< "${REVIEW_LINES}"
+        printf '    Branches (cannot prove the changes are contained in %s)\n' "${MAIN_REF}" >&2
+        while IFS="${US}" read -r branch wt reason; do
+            [ -z "${branch}" ] && continue
+            printf '      %b-%b %s (%s)\n' "${STYLE_INFO}" "${STYLE_RESET}" "${branch}" "${reason}" >&2
+            log_detail "      git branch -D ${branch}"
+        done <<< "${REVIEW_LINES}"
+    fi
+    if [ -n "${SELECTED_CLEANERS}" ]; then
+        while IFS= read -r name; do
+            [ -z "${name}" ] && continue
+            [ -s "${PLAN_DIR}/${name}.review_display" ] || continue
+            printf '    %s\n' "${name}" >&2
+            while IFS= read -r line; do
+                [ -z "${line}" ] && continue
+                printf '      %b-%b %s\n' "${STYLE_INFO}" "${STYLE_RESET}" "${line}" >&2
+            done < "${PLAN_DIR}/${name}.review_display"
+        done <<< "${SELECTED_CLEANERS}"
+    fi
+    _kl_gap_content
+fi
+
+if [ "${DRY_RUN}" = "1" ]; then
+    log_ok "dry-run: nothing was deleted"
+    exit 0
+fi
+
+if [ "${HAS_DELETE}" = "0" ]; then
+    log_success "Nothing can be deleted automatically (use --force for needs-review items)"
+    exit 0
+fi
+
+if [ "${ASSUME_YES}" != "1" ]; then
+    log_step "Delete these? (y/N)" "🧹"
+    log_prompt CONFIRM
+    if [[ ! "${CONFIRM}" =~ ^[Yy]$ ]]; then
+        log_warn "Cancelled"
+        exit 1
+    fi
+fi
+
+log_info "Deleting..."
+
+# --- deletion: worktrees and branches -----------------------------------------------
+
+DELETED_BRANCHES=0
+DELETED_WORKTREES=0
+FAILED_BRANCHES=""
+if [ -n "${DELETE_BRANCH_LINES}" ] && { [ "${TARGET_BRANCHES}" = "1" ] || [ "${TARGET_WORKTREES}" = "1" ]; }; then
+    while IFS="${US}" read -r branch wt; do
+        [ -z "${branch}" ] && continue
+        if [ "${TARGET_WORKTREES}" = "1" ] && [ -n "${wt}" ] && [ -d "${wt}" ]; then
+            log_detail "Removing worktree: ${wt}"
+            # A failed removal means one of git's protections (a lock etc.)
+            # fired; do not work around it, and keep the branch too.
+            if ! git worktree remove --force "${wt}" 2>/dev/null; then
+                log_error "failed to remove worktree: ${wt}"
+                FAILED_BRANCHES="${FAILED_BRANCHES}${branch}"$'\n'
+                continue
+            fi
+            DELETED_WORKTREES=$((DELETED_WORKTREES + 1))
+        fi
+        if [ "${TARGET_BRANCHES}" = "1" ]; then
+            log_detail "Deleting branch: ${branch}"
+            # A proof-3 tip is not an ancestor of the main ref, so -d would
+            # refuse; safety is guaranteed by the classification instead.
+            if git branch -D "${branch}" 2>/dev/null; then
+                DELETED_BRANCHES=$((DELETED_BRANCHES + 1))
+            else
+                log_error "failed to delete branch: ${branch}"
+                FAILED_BRANCHES="${FAILED_BRANCHES}${branch}"$'\n'
+            fi
+        fi
+    done <<< "${DELETE_BRANCH_LINES}"
+
+    git worktree prune
+fi
+
+# --- deletion: cleaner plugins --------------------------------------------------------
+
+FAILED_CLEANERS=""
+CLEANER_SUMMARY=""
+if [ -n "${SELECTED_CLEANERS}" ]; then
+    while IFS= read -r name; do
+        [ -z "${name}" ] && continue
+        [ -s "${PLAN_DIR}/${name}.delete" ] || continue
+        cpath="$(cleaner_path "${name}")"
+        del_args=(delete)
+        [ "${FORCE}" = "1" ] && del_args+=(--force)
+        # The delete phase re-validates: state may have changed since planning
+        # (a worktree removal may have failed), so the cleaner deletes only the
+        # ids it still classifies as deletable and reports the rest as skipped.
+        RC=0
+        OUT="$("${cpath}" "${del_args[@]}" < "${PLAN_DIR}/${name}.delete")" || RC=$?
+        n=0
+        failed=0
+        while IFS=$'\t' read -r status id reason; do
+            [ -z "${status}" ] && continue
+            case "${status}" in
+                deleted) n=$((n + 1)) ;;
+                skipped) log_detail "${name}: skipped ${id}${reason:+ (${reason})}" ;;
+                failed)
+                    log_error "${name}: failed to delete ${id}${reason:+ (${reason})}"
+                    failed=1
+                    ;;
+                *) log_warn "${name}: unrecognized result line: ${status}" ;;
+            esac
+        done <<< "${OUT}"
+        if [ "${RC}" != "0" ] || [ "${failed}" = "1" ]; then
+            FAILED_CLEANERS="${FAILED_CLEANERS}${name}"$'\n'
+        fi
+        CLEANER_SUMMARY="${CLEANER_SUMMARY}, ${n} ${name}"
+    done <<< "${SELECTED_CLEANERS}"
+fi
+
+# --- report ----------------------------------------------------------------------
+
+EXIT=0
+if [ -n "${FAILED_BRANCHES}" ]; then
+    log_error "some branches could not be deleted:"
+    printf '%s' "${FAILED_BRANCHES}" | while IFS= read -r b; do
+        [ -n "${b}" ] && log_detail "${b}"
+    done
+    EXIT=1
+fi
+if [ -n "${FAILED_CLEANERS}" ]; then
+    printf '%s' "${FAILED_CLEANERS}" | while IFS= read -r c; do
+        [ -n "${c}" ] && log_error "cleaner '${c}' reported failures"
+    done
+    EXIT=1
+fi
+[ "${EXIT}" != "0" ] && exit "${EXIT}"
+
+log_ok "Done (${DELETED_BRANCHES} branch(es), ${DELETED_WORKTREES} worktree(s)${CLEANER_SUMMARY})"
+if [ "${HAS_REVIEW}" = "1" ]; then
+    log_detail "to also delete needs-review items: kikori cleanup --force"
+fi

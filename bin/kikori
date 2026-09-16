@@ -1,0 +1,59 @@
+#!/bin/bash
+# kikori — git worktree session manager.
+#
+# Dispatches to libexec/kikori-<command>. Resolves its own installation directory
+# through symlinks so `ln -s .../bin/kikori /usr/local/bin/kikori` works.
+set -euo pipefail
+
+KIKORI_VERSION="0.1.0"
+
+resolve_self() {
+    local src="${BASH_SOURCE[0]}" dir
+    while [ -L "${src}" ]; do
+        dir="$(cd "$(dirname "${src}")" && pwd)"
+        src="$(readlink "${src}")"
+        case "${src}" in /*) ;; *) src="${dir}/${src}" ;; esac
+    done
+    cd "$(dirname "${src}")/.." && pwd
+}
+
+KIKORI_ROOT="$(resolve_self)"
+export KIKORI_ROOT
+
+usage() {
+    cat <<'EOF'
+kikori — git worktree session manager
+
+USAGE:
+  kikori start [options]      Create a session worktree with a generated branch name
+  kikori cleanup [options]    Delete merged session branches, their worktrees, and
+                              resources managed by cleaner plugins
+  kikori trust [options]      Trust the repository's .kikori/config.sh
+  kikori help [command]       Show help (or `kikori <command> --help`)
+  kikori version              Show version
+
+Run `kikori <command> --help` for command options.
+EOF
+}
+
+cmd="${1:-}"
+case "${cmd}" in
+    ""|-h|--help|help)
+        if [ "${cmd}" = "help" ] && [ -n "${2:-}" ] && [ -x "${KIKORI_ROOT}/libexec/kikori-$2" ]; then
+            exec "${KIKORI_ROOT}/libexec/kikori-$2" --help
+        fi
+        usage
+        ;;
+    -v|--version|version)
+        printf 'kikori %s\n' "${KIKORI_VERSION}"
+        ;;
+    *)
+        if [ -x "${KIKORI_ROOT}/libexec/kikori-${cmd}" ]; then
+            shift
+            exec "${KIKORI_ROOT}/libexec/kikori-${cmd}" "$@"
+        fi
+        printf 'kikori: unknown command: %s\n\n' "${cmd}" >&2
+        usage >&2
+        exit 2
+        ;;
+esac

@@ -1,0 +1,355 @@
+#!/bin/bash
+# kikori start — create a session git worktree under <worktrees dir>/<branch>.
+#
+# The branch name is "YYYYMMDD-<slug>" where the slug is produced by the
+# kikori_slug hook from the task description you type. Without a task, without the
+# hook, or when the hook output is not slug-shaped, the name falls back to
+# "YYYYMMDD-HHMMSS". Branch naming is overridable via the kikori_branch_name hook.
+#
+# A git worktree only contains committed files. Paths listed in the copy file
+# (default .kikori-copy at the repo root; gitignored personal settings, build
+# caches, etc.) are copied into the new worktree at the same relative path.
+# The copy source is the worktree of the base branch when one exists, otherwise
+# the main checkout; entries missing there are inherited from the main checkout.
+set -euo pipefail
+
+. "${KIKORI_ROOT}/lib/log.sh"
+. "${KIKORI_ROOT}/lib/config.sh"
+
+usage() {
+    cat <<'EOF'
+USAGE: kikori start [options]
+
+OPTIONS:
+  --base <branch>      Base branch (default: KIKORI_BASE_BRANCH, normally origin/<main>).
+                       Skips the interactive prompt.
+  --task <text>        Task description used for slug generation. Skips the prompt.
+                       Pass an empty string to skip slug generation entirely.
+  --copy-from <dir>    Copy-file source directory. Skips auto-detection.
+  --skip-post-create   Skip the kikori_post_create hook.
+  --dry-run            Print the planned branch name and path without creating anything.
+  -h, --help           Show this help.
+
+CONFIG (see README):
+  KIKORI_BASE_BRANCH, KIKORI_WORKTREES_DIR, KIKORI_COPY_FILE, hooks kikori_slug /
+  kikori_branch_name / kikori_post_create in .kikori/config.sh or ~/.config/kikori/config.sh.
+EOF
+}
+
+DRY_RUN=0
+SKIP_POST_CREATE=0
+OPT_BASE=""
+OPT_TASK=""
+TASK_SET=0
+OPT_COPY_FROM=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --base) OPT_BASE="${2:?--base requires a value}"; shift ;;
+        --task) OPT_TASK="${2-}"; TASK_SET=1; shift ;;
+        --copy-from) OPT_COPY_FROM="${2:?--copy-from requires a value}"; shift ;;
+        --skip-post-create) SKIP_POST_CREATE=1 ;;
+        --dry-run) DRY_RUN=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *) log_error "unknown option: $1"; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+MAIN_ROOT="$(kikori_resolve_main_root)" || { log_error "not inside a git repository (or the repository is bare)"; exit 2; }
+kikori_load_config "${MAIN_ROOT}"
+
+SETUP_INCOMPLETE=0
+COPY_LIST_FILE_NAME="${KIKORI_COPY_FILE}"
+
+TMP_FILES=()
+cleanup_tmp() {
+    printf '\033[?25h' >&2 2>/dev/null || true
+    for f in ${TMP_FILES[@]+"${TMP_FILES[@]}"}; do
+        [ -n "${f}" ] && rm -f "${f}"
+    done
+}
+trap cleanup_tmp EXIT
+
+# Decide the copy source for the copy file. When the base branch is checked out
+# as a worktree, use that: personal settings are usually freshest in the most
+# recent working worktree, and pinning to the main checkout would inherit stale
+# content.
+resolve_copy_source() {
+    if [ -n "${OPT_COPY_FROM}" ]; then
+        printf '%s' "${OPT_COPY_FROM}"
+        return 0
+    fi
+    case "${BASE_BRANCH}" in
+        "${KIKORI_REMOTE}"/*)
+            printf '%s' "${MAIN_ROOT}"
+            return 0
+            ;;
+    esac
+    local line path=""
+    while IFS= read -r line; do
+        case "${line}" in
+            "worktree "*) path="${line#worktree }" ;;
+            "branch refs/heads/${BASE_BRANCH}")
+                printf '%s' "${path}"
+                return 0
+                ;;
+        esac
+    done < <(git -C "${MAIN_ROOT}" worktree list --porcelain)
+    printf '%s' "${MAIN_ROOT}"
+}
+
+# Copy untracked paths listed in the copy file into the new worktree at the
+# same relative path. Missing sources are skipped; copy failures only warn
+# (the worktree creation itself still counts as a success).
+copy_unmanaged_paths() {
+    local copy_list="${MAIN_ROOT}/${COPY_LIST_FILE_NAME}"
+    [ -f "${copy_list}" ] || return 0
+    # Entries are expanded as globs (personal paths differ per user). Restrict
+    # IFS to newline so glob expansion is not split on spaces.
+    local IFS=$'\n'
+    local entry
+    while read -r entry || [ -n "${entry}" ]; do
+        entry="${entry%%#*}"
+        entry="$(printf '%s' "${entry}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+        [ -z "${entry}" ] && continue
+        case "${entry}" in
+            /*|*..*)
+                # Only root-relative paths are accepted, to prevent writes
+                # outside the worktree.
+                log_warn "skipping invalid entry: ${entry}"
+                log_detail "only paths relative to the repository root are allowed"
+                continue
+                ;;
+        esac
+        # Entries absent from the base worktree (e.g. build artifacts that this
+        # worktree never produced) are inherited from the main checkout.
+        if ! copy_entry_from "${COPY_SOURCE}" "${entry}"; then
+            if [ "${COPY_SOURCE}" = "${MAIN_ROOT}" ] || ! copy_entry_from "${MAIN_ROOT}" "${entry}"; then
+                log_detail "no copy source, skipping: ${entry}"
+            fi
+        fi
+    done < "${copy_list}"
+}
+
+# Expand entry (glob allowed) against root and copy every match.
+# Returns 1 when nothing matched.
+copy_entry_from() {
+    local root="$1" entry="$2" src rel matched=1
+    for src in "${root}"/${entry}; do
+        [ -e "${src}" ] || continue
+        matched=0
+        rel="${src#"${root}"/}"
+        copy_one_path "${src}" "${rel}"
+    done
+    return "${matched}"
+}
+
+# Copy-on-write when the platform supports it: multi-GB build caches copy
+# instantly and consume almost no disk on APFS (cp -c) and on Btrfs/XFS
+# (--reflink=auto). Both fall back to a regular copy on other filesystems.
+copy_tree() {
+    local src="$1" dest_dir="$2"
+    case "$(uname -s)" in
+        Darwin) cp -Rc "${src}" "${dest_dir}/" ;;
+        *) cp -R --reflink=auto "${src}" "${dest_dir}/" ;;
+    esac
+}
+
+# Successful copies are not logged (the entry list can be long; the copy file
+# itself documents what gets copied). Only failures warn.
+copy_one_path() {
+    local src="$1" rel="$2" dest_dir
+    if [ "${DRY_RUN}" = "1" ]; then
+        return 0
+    fi
+    dest_dir="${WORKTREE_PATH}/$(dirname "${rel}")"
+    if ! mkdir -p "${dest_dir}"; then
+        log_warn "copy failed: ${rel}"
+        return 0
+    fi
+    # A partial copy (disk full etc.) tends to break later tooling in confusing
+    # ways, so remove it before warning.
+    if ! copy_tree "${src}" "${dest_dir}"; then
+        rm -rf "${WORKTREE_PATH:?}/${rel}"
+        log_warn "copy failed: ${rel}"
+        SETUP_INCOMPLETE=1
+    fi
+}
+
+# Project-specific setup after the copy phase (dependency install, simulator
+# creation, relinking symlinks that still point into the copy source, ...).
+# Failure only warns: the worktree itself is usable and the hook can be re-run
+# by hand.
+run_post_create_hook() {
+    kikori_has_hook kikori_post_create || return 0
+    if [ "${SKIP_POST_CREATE}" = "1" ]; then
+        log_detail "skipping kikori_post_create (--skip-post-create)"
+        return 0
+    fi
+    log_step "post-create hook (kikori_post_create)" "📦"
+    if [ "${DRY_RUN}" = "1" ]; then
+        log_detail "skipped (dry-run)"
+        return 0
+    fi
+    if ! kikori_post_create "${WORKTREE_PATH}" "${BRANCH_NAME}" "${BASE_BRANCH}"; then
+        log_warn "kikori_post_create failed"
+        log_detail "fix the cause and re-run the setup manually inside the worktree"
+        SETUP_INCOMPLETE=1
+    fi
+}
+
+# The kikori_slug hook may return prose (an LLM asking for clarification, for
+# example). Sanitizing alone could turn prose into an unrelated slug that then
+# becomes a branch name, so output that is not slug-shaped is discarded and the
+# timestamp fallback is used instead.
+generate_slug() {
+    local task="$1" raw candidate
+    raw="$(kikori_slug "${task}" 2>/dev/null | sed -e '/^[[:space:]]*$/d' -e 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -1)"
+    candidate="$(printf '%s' "${raw}" | tr -d '`"'"'" | tr '[:upper:]' '[:lower:]' | sed 's/[.。]*$//')"
+    if [ "${#candidate}" -le 50 ] &&
+        printf '%s' "${candidate}" | grep -Eq '^[a-z0-9]+(-[a-z0-9]+)*$'; then
+        printf '%s\n' "${candidate}"
+    else
+        printf '\n%s\n' "${raw}"
+    fi
+}
+
+cd "${MAIN_ROOT}"
+
+# Fetch the default base in the background while the user types (dry-run never
+# touches the remote).
+SPEC_FETCH_BRANCH="${KIKORI_MAIN_BRANCH}"
+SPEC_FETCH_PID=""
+if [ "${DRY_RUN}" != "1" ]; then
+    ( git fetch "${KIKORI_REMOTE}" "${SPEC_FETCH_BRANCH}" ) &>/dev/null &
+    SPEC_FETCH_PID=$!
+fi
+
+if [ "${DRY_RUN}" = "1" ]; then
+    log_warn "DRY RUN: nothing will be created or fetched"
+fi
+
+if [ "${TASK_SET}" = "1" ]; then
+    TASK="${OPT_TASK}"
+else
+    # The previous line is the shell prompt (or the dry-run warning), which the
+    # gap tracker cannot see, so separate explicitly.
+    log_blank
+    log_step "Describe the task (Enter to skip)" "📝"
+    log_prompt TASK
+fi
+
+# Slug generation runs concurrently with the base-branch prompt.
+SLUG=""
+SLUG_PID=""
+SLUG_LOG=""
+if [ -n "${TASK}" ] && kikori_has_hook kikori_slug; then
+    SLUG_LOG=$(mktemp); TMP_FILES+=("${SLUG_LOG}")
+    ( generate_slug "${TASK}" ) > "${SLUG_LOG}" 2>&1 &
+    SLUG_PID=$!
+fi
+
+if [ -n "${OPT_BASE}" ]; then
+    BASE_BRANCH="${OPT_BASE}"
+    log_step "Base branch: ${BASE_BRANCH} (from --base)" "🌱"
+else
+    log_step "Base branch (Enter for ${KIKORI_BASE_BRANCH})" "🌱"
+    log_prompt BASE_BRANCH
+    BASE_BRANCH="${BASE_BRANCH:-${KIKORI_BASE_BRANCH}}"
+fi
+
+if [[ "${BASE_BRANCH}" == -* ]]; then
+    log_error "invalid base branch: ${BASE_BRANCH}"
+    log_detail "values starting with a hyphen would be parsed as option flags"
+    exit 1
+fi
+
+if [ -n "${SLUG_PID}" ]; then
+    if spin_pid "${SLUG_PID}" "Generating branch slug" "🤖"; then
+        SLUG=$(sed -n '1p' "${SLUG_LOG}")
+        SLUG_RAW=$(sed -n '2p' "${SLUG_LOG}")
+    fi
+    if [ -n "${SLUG}" ]; then
+        log_ok "Branch slug: ${STYLE_BOLD}${SLUG}${STYLE_RESET}"
+    else
+        log_detail "slug generation skipped (falling back to timestamp)"
+        if [ -n "${SLUG_RAW:-}" ]; then
+            log_detail "hook output was not slug-shaped: ${SLUG_RAW}"
+        fi
+    fi
+fi
+
+if kikori_has_hook kikori_branch_name; then
+    BRANCH_NAME="$(kikori_branch_name "${SLUG}")"
+    if [ -z "${BRANCH_NAME}" ] || ! git check-ref-format "refs/heads/${BRANCH_NAME}" 2>/dev/null; then
+        log_error "kikori_branch_name returned an invalid branch name: ${BRANCH_NAME}"
+        exit 1
+    fi
+else
+    BRANCH_NAME="$(kikori_default_branch_name "${SLUG}")"
+fi
+
+if [[ "${BASE_BRANCH}" == "${KIKORI_REMOTE}"/* ]]; then
+    REMOTE_BRANCH="${BASE_BRANCH#"${KIKORI_REMOTE}"/}"
+    log_step_inline "Fetching ${KIKORI_REMOTE}/${REMOTE_BRANCH}" "🔄"
+    if [ "${DRY_RUN}" = "1" ]; then
+        log_step_skip "dry-run"
+    elif [ "${REMOTE_BRANCH}" = "${SPEC_FETCH_BRANCH}" ]; then
+        if wait "${SPEC_FETCH_PID}"; then
+            log_step_done
+        else
+            log_step_skip "offline?"
+        fi
+        SPEC_FETCH_PID=""
+    else
+        wait "${SPEC_FETCH_PID}" 2>/dev/null || true
+        SPEC_FETCH_PID=""
+        if git fetch "${KIKORI_REMOTE}" "${REMOTE_BRANCH}" &>/dev/null; then
+            log_step_done
+        else
+            log_step_skip "offline?"
+        fi
+    fi
+elif [ -n "${SPEC_FETCH_PID}" ]; then
+    wait "${SPEC_FETCH_PID}" 2>/dev/null || true
+    SPEC_FETCH_PID=""
+fi
+
+WORKTREE_PATH="${KIKORI_WORKTREES_DIR}/${BRANCH_NAME}"
+
+log_step_inline "Creating worktree (base: ${BASE_BRANCH})" "📦"
+if [ "${DRY_RUN}" = "1" ]; then
+    log_step_skip "dry-run"
+    log_detail "would run: git worktree add -b \"${BRANCH_NAME}\" \"${WORKTREE_PATH}\" \"${BASE_BRANCH}\""
+else
+    mkdir -p "${KIKORI_WORKTREES_DIR}"
+    if WT_ERR=$(git worktree add -b "${BRANCH_NAME}" "${WORKTREE_PATH}" "${BASE_BRANCH}" 2>&1 1>/dev/null); then
+        log_step_done
+    else
+        log_step_fail
+        log_error "failed to create the worktree"
+        if [ -n "${WT_ERR}" ]; then
+            log_detail "${WT_ERR}"
+        fi
+        log_detail "retry with: git worktree add -b \"${BRANCH_NAME}\" \"${WORKTREE_PATH}\" \"${BASE_BRANCH}\""
+        exit 1
+    fi
+fi
+
+COPY_SOURCE="$(resolve_copy_source)"
+if [ -f "${MAIN_ROOT}/${COPY_LIST_FILE_NAME}" ]; then
+    log_step "Copying untracked files" "📦"
+    log_detail "entries are listed in ${COPY_LIST_FILE_NAME}"
+    copy_unmanaged_paths
+fi
+run_post_create_hook
+
+if [ "${DRY_RUN}" = "1" ]; then
+    log_ok "Worktree ready (dry-run)"
+elif [ "${SETUP_INCOMPLETE}" = "1" ]; then
+    log_warn "Worktree created, but setup did not complete (see warnings above)"
+else
+    log_ok "Worktree ready"
+fi
+log_detail "Branch  ${STYLE_INFO}${BRANCH_NAME}${STYLE_RESET}"
+log_detail "Path    ${WORKTREE_PATH}"

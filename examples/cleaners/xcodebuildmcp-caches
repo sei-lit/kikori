@@ -1,0 +1,209 @@
+#!/bin/bash
+# Example kikori cleaner: XcodeBuildMCP workspace caches.
+#
+# Deletes caches under ~/Library/Developer/XcodeBuildMCP/workspaces/<key> whose
+# original workspace root directory no longer exists. Each cache contains
+# DerivedData and can reach several GB.
+#
+# <key> is built by XcodeBuildMCP (build/utils/workspace-identity.js) as
+#   "<slugified basename of root>-<first 12 hex chars of sha256(root)>".
+# The root cannot be recovered from the hash, so candidate paths recorded
+# inside the cache (WorkspacePath in DerivedData/*/info.plist, else absolute
+# paths appearing in logs/) and their ancestors are re-keyed and compared.
+#
+#   root resolved and gone                       -> auto (delete)
+#   root resolved and alive                      -> omitted (in use)
+#   root unresolved, but every WorkspacePath in
+#   DerivedData/*/info.plist is gone             -> auto (the root can come from
+#                                                   a cwd that is never recorded;
+#                                                   if every built project is
+#                                                   gone the DerivedData will
+#                                                   not be reused)
+#   neither determinable                         -> review (the only direction
+#                                                   this can err is keeping too
+#                                                   much)
+#
+# Protocol: see README "Cleaner plugins".
+#   plan [--assume-removed <path>]...   TSV plan lines on stdout
+#   delete [--force]                    ids on stdin, TSV result lines on stdout
+#
+# Environment:
+#   XCODEBUILDMCP_WORKSPACES_DIR  cache location (test seam)
+set -eo pipefail
+
+WORKSPACES_DIR="${XCODEBUILDMCP_WORKSPACES_DIR:-${HOME}/Library/Developer/XcodeBuildMCP/workspaces}"
+
+MODE="${1:-}"
+shift || true
+INCLUDE_UNKNOWN=0
+ASSUME_GONE_ROOTS=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --force) INCLUDE_UNKNOWN=1 ;;
+        --assume-removed)
+            [ -n "${2:-}" ] || { echo "--assume-removed requires a path" >&2; exit 1; }
+            ASSUME_GONE_ROOTS="${ASSUME_GONE_ROOTS}$2"$'\n'
+            shift ;;
+        *) echo "unknown option: $1" >&2; exit 1 ;;
+    esac
+    shift
+done
+
+# Same slugification as workspace-identity.js workspaceNameForRoot.
+slug_of() {
+    local s
+    s="$(basename "$1" | sed -E 's/[^A-Za-z0-9._-]+/-/g; s/^[.-]+//; s/[.-]+$//' | cut -c1-64)"
+    printf '%s\n' "${s:-workspace}"
+}
+
+hash_of() {
+    printf '%s' "$1" | shasum -a 256 | cut -c1-12
+}
+
+# plutil is macOS-only; fall back to python3 plistlib elsewhere (CI on Linux).
+plist_workspace_path() {
+    if command -v plutil >/dev/null 2>&1; then
+        plutil -extract WorkspacePath raw -o - "$1" 2>/dev/null || true
+    else
+        python3 -c 'import plistlib,sys
+print(plistlib.load(open(sys.argv[1],"rb")).get("WorkspacePath",""))' "$1" 2>/dev/null || true
+    fi
+}
+
+# Compare the path and its ancestors against the key; print the matching root.
+# The cheap slug check runs before the hash.
+match_root_in_ancestors() {
+    local key="$1" p="$2"
+    while [ -n "${p}" ] && [ "${p}" != "/" ]; do
+        if [ "${key}" = "$(slug_of "${p}")-$(hash_of "${p}")" ]; then
+            printf '%s\n' "${p}"
+            return 0
+        fi
+        p="$(dirname "${p}")"
+    done
+    return 1
+}
+
+resolve_root() {
+    local dir="$1" key="$2" pl wp p
+
+    # DerivedData's info.plist is the most reliable source (Xcode records the
+    # WorkspacePath there).
+    for pl in "${dir}"/DerivedData/*/info.plist; do
+        [ -f "${pl}" ] || continue
+        wp="$(plist_workspace_path "${pl}")"
+        [ -n "${wp}" ] || continue
+        match_root_in_ancestors "${key}" "${wp}" && return 0
+    done
+
+    # Fallback: absolute paths appearing in logs (xcodebuild arguments etc.).
+    # False positives are rejected by the hash comparison, so the pattern can
+    # be broad.
+    [ -d "${dir}/logs" ] || return 1
+    while IFS= read -r p; do
+        match_root_in_ancestors "${key}" "${p}" && return 0
+    done < <(grep -rhoaE "/(Users|Volumes|private|var|tmp|opt)/[^[:space:]\"']+" "${dir}/logs" 2>/dev/null \
+             | awk '!seen[$0]++' | head -200)
+    return 1
+}
+
+# True when the path can be treated as gone: it does not exist, or it is at or
+# under an --assume-removed path.
+path_gone() {
+    local p="$1" g
+    [ -e "${p}" ] || return 0
+    while IFS= read -r g; do
+        [ -z "${g}" ] && continue
+        case "${p}" in
+            "${g}" | "${g}"/*) return 0 ;;
+        esac
+    done <<< "${ASSUME_GONE_ROOTS}"
+    return 1
+}
+
+all_built_workspaces_gone() {
+    local dir="$1" pl wp found=0
+    for pl in "${dir}"/DerivedData/*/info.plist; do
+        [ -f "${pl}" ] || continue
+        wp="$(plist_workspace_path "${pl}")"
+        [ -n "${wp}" ] || return 1
+        found=1
+        path_gone "${wp}" || return 1
+    done
+    [ "${found}" = "1" ]
+}
+
+# Emits "orphan<TAB><dir>" / "unknown<TAB><dir>"; live caches are omitted.
+classify_caches() {
+    local dir key root
+    for dir in "${WORKSPACES_DIR}"/*/; do
+        [ -d "${dir}" ] || continue
+        dir="${dir%/}"
+        key="$(basename "${dir}")"
+        if root="$(resolve_root "${dir}" "${key}")"; then
+            path_gone "${root}" || continue
+            printf 'orphan\t%s\n' "${dir}"
+        elif all_built_workspaces_gone "${dir}"; then
+            printf 'orphan\t%s\n' "${dir}"
+        else
+            printf 'unknown\t%s\n' "${dir}"
+        fi
+    done
+}
+
+display_of() {
+    printf '%s  %s' "$(du -sh "$1" 2>/dev/null | cut -f1 | xargs)" "$(basename "$1")"
+}
+
+[ -d "${WORKSPACES_DIR}" ] || exit 0
+
+case "${MODE}" in
+    plan)
+        while IFS=$'\t' read -r status dir; do
+            [ -z "${dir}" ] && continue
+            if [ "${status}" = "orphan" ]; then
+                printf 'auto\t%s\t%s\n' "${dir}" "$(display_of "${dir}")"
+            else
+                printf 'review\t%s\t%s\t%s\n' "${dir}" "$(display_of "${dir}")" "original workspace location unknown"
+            fi
+        done <<< "$(classify_caches)"
+        ;;
+    delete)
+        TAB=$'\t'
+        CONFIRMED="$(cat)"
+        # Re-classify at deletion time: the state may have changed since the
+        # plan (e.g. a worktree removal failed and its cache root is back to
+        # "alive"), so confirmed ids are not deleted unconditionally.
+        CLASSIFIED="$(classify_caches)"
+        RC=0
+        while IFS= read -r dir; do
+            [ -z "${dir}" ] && continue
+            # Never delete outside the workspaces dir (guards against caller
+            # assembly mistakes).
+            case "${dir}" in
+                "${WORKSPACES_DIR}"/*) ;;
+                *) printf 'failed\t%s\t%s\n' "${dir}" "outside ${WORKSPACES_DIR}"; RC=1; continue ;;
+            esac
+            if printf '%s\n' "${CLASSIFIED}" | grep -Fxq "orphan${TAB}${dir}"; then
+                :
+            elif [ "${INCLUDE_UNKNOWN}" = "1" ] \
+                && printf '%s\n' "${CLASSIFIED}" | grep -Fxq "unknown${TAB}${dir}"; then
+                :
+            else
+                printf 'skipped\t%s\t%s\n' "${dir}" "no longer classified as deletable"
+                continue
+            fi
+            if rm -rf "${dir}"; then
+                printf 'deleted\t%s\n' "${dir}"
+            else
+                printf 'failed\t%s\t%s\n' "${dir}" "rm failed"
+                RC=1
+            fi
+        done <<< "${CONFIRMED}"
+        exit "${RC}"
+        ;;
+    *)
+        echo "usage: $(basename "$0") plan [--assume-removed <path>]... | delete [--force]" >&2
+        exit 2
+        ;;
+esac

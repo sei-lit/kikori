@@ -1,0 +1,67 @@
+#!/bin/bash
+# kikori trust — mark the current repository's .kikori/config.sh as trusted.
+#
+# Repository config is executable shell that arrives with the repository, so it
+# is never sourced until its exact content has been trusted (see lib/config.sh).
+set -euo pipefail
+
+. "${KIKORI_ROOT}/lib/log.sh"
+. "${KIKORI_ROOT}/lib/config.sh"
+
+usage() {
+    cat <<'EOF'
+USAGE: kikori trust [options]
+
+Trusts <repo>/.kikori/config.sh at its current content. Editing the file (or
+pulling a commit that changes it) invalidates the trust until you re-run this.
+
+OPTIONS:
+  --show      List all trusted config files.
+  --revoke    Remove trust for the current repository's config.
+  -h, --help  Show this help.
+EOF
+}
+
+MODE=trust
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --show) MODE=show ;;
+        --revoke) MODE=revoke ;;
+        -h|--help) usage; exit 0 ;;
+        *) log_error "unknown option: $1"; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+if [ "${MODE}" = "show" ]; then
+    trust_file="$(kikori_trust_file)"
+    if [ -s "${trust_file}" ]; then
+        cat "${trust_file}"
+    else
+        log_info "no trusted config files"
+    fi
+    exit 0
+fi
+
+MAIN_ROOT="$(kikori_resolve_main_root)" || { log_error "not inside a git repository (or the repository is bare)"; exit 2; }
+CONFIG="${MAIN_ROOT}/.kikori/config.sh"
+
+if [ "${MODE}" = "revoke" ]; then
+    trust_file="$(kikori_trust_file)"
+    if [ -f "${trust_file}" ]; then
+        tmp="${trust_file}.tmp.$$"
+        grep -vF "  ${CONFIG}" "${trust_file}" > "${tmp}" || true
+        mv "${tmp}" "${trust_file}"
+    fi
+    log_ok "revoked trust for ${CONFIG}"
+    exit 0
+fi
+
+if [ ! -f "${CONFIG}" ]; then
+    log_error "no repository config found: ${CONFIG}"
+    exit 2
+fi
+CONFIG="$(cd "$(dirname "${CONFIG}")" && pwd)/$(basename "${CONFIG}")"
+kikori_record_trust "${CONFIG}" "$(kikori_config_hash "${CONFIG}")"
+log_ok "trusted ${CONFIG}"
+log_detail "re-run 'kikori trust' after the file changes"

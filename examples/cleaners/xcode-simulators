@@ -1,0 +1,114 @@
+#!/bin/bash
+# Example kikori cleaner: per-worktree iOS simulators.
+#
+# Assumes your post-create hook creates one simulator per worktree, named
+# "<prefix><worktree basename>" (see examples/config.sh). A simulator whose
+# worktree directory no longer exists — or is about to be removed
+# (--assume-removed) — is an orphan.
+#
+#   orphan and Shutdown       -> auto (delete)
+#   orphan but not Shutdown   -> review (Booted/Booting may be in use;
+#                                deleted only with --force)
+#   worktree still exists     -> omitted
+#
+# Protocol: see README "Cleaner plugins".
+#
+# Environment (exported by kikori cleanup):
+#   KIKORI_WORKTREES_DIR  where session worktrees live
+# Environment (yours):
+#   KIKORI_SIM_PREFIX     simulator name prefix (default "wt-")
+set -eo pipefail
+
+PREFIX="${KIKORI_SIM_PREFIX:-wt-}"
+
+MODE="${1:-}"
+shift || true
+FORCE=0
+ASSUME_GONE=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --force) FORCE=1 ;;
+        --assume-removed)
+            [ -n "${2:-}" ] || { echo "--assume-removed requires a path" >&2; exit 1; }
+            ASSUME_GONE="${ASSUME_GONE}$2"$'\n'
+            shift ;;
+        *) echo "unknown option: $1" >&2; exit 1 ;;
+    esac
+    shift
+done
+
+command -v xcrun >/dev/null 2>&1 || exit 0
+
+worktree_gone() {
+    local base="$1" path g
+    path="${KIKORI_WORKTREES_DIR:?KIKORI_WORKTREES_DIR is not set}/${base}"
+    [ -e "${path}" ] || return 0
+    while IFS= read -r g; do
+        [ -z "${g}" ] && continue
+        [ "${path}" = "${g}" ] && return 0
+    done <<< "${ASSUME_GONE}"
+    return 1
+}
+
+# Emits "udid<TAB>name<TAB>state" for orphaned simulators with our prefix.
+list_orphans() {
+    xcrun simctl list devices --json | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+for devices in data.get("devices", {}).values():
+    for d in devices:
+        print("%s\t%s\t%s" % (d["udid"], d["name"], d["state"]))
+' | while IFS=$'\t' read -r udid name state; do
+        case "${name}" in
+            "${PREFIX}"*) ;;
+            *) continue ;;
+        esac
+        worktree_gone "${name#"${PREFIX}"}" || continue
+        printf '%s\t%s\t%s\n' "${udid}" "${name}" "${state}"
+    done
+}
+
+case "${MODE}" in
+    plan)
+        while IFS=$'\t' read -r udid name state; do
+            [ -z "${udid}" ] && continue
+            if [ "${state}" = "Shutdown" ]; then
+                printf 'auto\t%s\t%s (%s)\n' "${udid}" "${name}" "${udid}"
+            else
+                printf 'review\t%s\t%s (%s)\t%s, possibly in use\n' "${udid}" "${name}" "${udid}" "${state}"
+            fi
+        done <<< "$(list_orphans)"
+        ;;
+    delete)
+        CONFIRMED="$(cat)"
+        # Re-validate against the current orphan set: a simulator may have been
+        # booted, or its worktree resurrected, since the plan.
+        ORPHANS="$(list_orphans)"
+        RC=0
+        while IFS= read -r udid; do
+            [ -z "${udid}" ] && continue
+            line="$(printf '%s\n' "${ORPHANS}" | awk -F'\t' -v u="${udid}" '$1 == u { print; exit }')"
+            if [ -z "${line}" ]; then
+                printf 'skipped\t%s\t%s\n' "${udid}" "no longer an orphan"
+                continue
+            fi
+            state="$(printf '%s' "${line}" | cut -f3)"
+            if [ "${state}" != "Shutdown" ] && [ "${FORCE}" != "1" ]; then
+                printf 'skipped\t%s\t%s\n' "${udid}" "not Shutdown"
+                continue
+            fi
+            [ "${state}" != "Shutdown" ] && xcrun simctl shutdown "${udid}" >/dev/null 2>&1 || true
+            if xcrun simctl delete "${udid}" >/dev/null 2>&1; then
+                printf 'deleted\t%s\n' "${udid}"
+            else
+                printf 'failed\t%s\t%s\n' "${udid}" "simctl delete failed"
+                RC=1
+            fi
+        done <<< "${CONFIRMED}"
+        exit "${RC}"
+        ;;
+    *)
+        echo "usage: $(basename "$0") plan [--assume-removed <path>]... | delete [--force]" >&2
+        exit 2
+        ;;
+esac
