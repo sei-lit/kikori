@@ -5,14 +5,21 @@ on:
   pull_request:
 
 jobs:
+  # shellcheck is preinstalled on ubuntu runners only.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck -x -s bash bin/kikori libexec/* lib/*.sh examples/cleaners/* tests/run.sh tests/stubs/gh
+
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: shellcheck
-        run: shellcheck -x -s bash bin/kikori libexec/* lib/*.sh examples/cleaners/* tests/run.sh tests/stubs/gh
       - name: tests
         run: tests/run.sh
