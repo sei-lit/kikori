@@ -187,7 +187,8 @@ kikori_list_cleaners() {
     local seen=" " f name
 
     for f in "${main_root}/.kikori/cleaners"/*; do
-        [ -f "${f}" ] && [ -x "${f}" ] || continue
+        [ -f "${f}" ] || continue
+        [ -x "${f}" ] || continue
         name="$(basename "${f}")"
         case "${seen}" in *" ${name} "*) continue ;; esac
         seen="${seen}${name} "
@@ -196,7 +197,10 @@ kikori_list_cleaners() {
 
     for f in ${KIKORI_CLEANERS}; do
         case "${f}" in /*) ;; *) f="${main_root}/${f}" ;; esac
-        [ -f "${f}" ] && [ -x "${f}" ] || { log_warn "cleaner is not executable, skipping: ${f}"; continue; }
+        if [ ! -f "${f}" ] || [ ! -x "${f}" ]; then
+            log_warn "cleaner is not executable, skipping: ${f}"
+            continue
+        fi
         name="$(basename "${f}")"
         case "${seen}" in *" ${name} "*) continue ;; esac
         seen="${seen}${name} "

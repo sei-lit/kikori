@@ -97,7 +97,9 @@ case "${MODE}" in
                 printf 'skipped\t%s\t%s\n' "${udid}" "not Shutdown"
                 continue
             fi
-            [ "${state}" != "Shutdown" ] && xcrun simctl shutdown "${udid}" >/dev/null 2>&1 || true
+            if [ "${state}" != "Shutdown" ]; then
+                xcrun simctl shutdown "${udid}" >/dev/null 2>&1 || true
+            fi
             if xcrun simctl delete "${udid}" >/dev/null 2>&1; then
                 printf 'deleted\t%s\n' "${udid}"
             else
