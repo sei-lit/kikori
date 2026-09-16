@@ -68,7 +68,9 @@ kikori_load_config() {
     # base new work on, or judge deletions against, the wrong branch.
     KIKORI_REMOTE="${KIKORI_REMOTE:-origin}"
     if [ -z "${KIKORI_MAIN_BRANCH:-}" ]; then
-        KIKORI_MAIN_BRANCH="$(git symbolic-ref --short "refs/remotes/${KIKORI_REMOTE}/HEAD" 2>/dev/null | sed "s|^${KIKORI_REMOTE}/||")"
+        # `|| true` keeps a missing remote HEAD from killing set -e callers;
+        # the fallback below (and kikori_require_main_branch) handles it.
+        KIKORI_MAIN_BRANCH="$(git symbolic-ref --short "refs/remotes/${KIKORI_REMOTE}/HEAD" 2>/dev/null | sed "s|^${KIKORI_REMOTE}/||" || true)"
         if [ -z "${KIKORI_MAIN_BRANCH}" ]; then
             local guess
             for guess in main master; do

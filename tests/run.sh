@@ -67,7 +67,7 @@ setup_sandbox() {
     printf 'acme/repo\n' > "${GH_STUB_DIR}/repo"
     : > "${GH_STUB_DIR}/remote-commits"
 
-    git init -q --bare "${SANDBOX}/remote.git"
+    git init -q --bare --initial-branch=main "${SANDBOX}/remote.git"
     git clone -q "${SANDBOX}/remote.git" "${SANDBOX}/repo" 2>/dev/null
     (
         cd "${SANDBOX}/repo" || exit 1
@@ -108,6 +108,15 @@ test_start_creates_worktree_and_branch() {
     wt="$(git worktree list --porcelain | grep -c '^worktree ')"
     assert_eq "${wt}" "2" "main checkout + new worktree"
     [ -d "${SANDBOX}/repo-worktrees" ] || fail "worktrees dir not created"
+}
+
+test_start_works_without_remote_head() {
+    # An unresolvable remote HEAD (fresh clone of a bare repo, CI checkouts)
+    # must fall back to detecting main, not kill the command under set -e.
+    git remote set-head origin -d
+    local out
+    out="$("${KIKORI}" start --dry-run --task "" --base origin/main </dev/null 2>&1)"
+    assert_contains "${out}" "Worktree ready"
 }
 
 test_start_dry_run_creates_nothing() {
@@ -389,6 +398,7 @@ EOF
 
 for t in \
     test_start_creates_worktree_and_branch \
+    test_start_works_without_remote_head \
     test_start_dry_run_creates_nothing \
     test_start_slug_hook_names_branch \
     test_start_rejects_prose_slug \
